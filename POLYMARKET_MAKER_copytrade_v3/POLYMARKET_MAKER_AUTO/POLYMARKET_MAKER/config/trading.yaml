@@ -1,0 +1,9 @@
+# Trading execution parameters
+order_slice_min: 1.0          # 单笔下单最小数量
+order_slice_max: 2.0          # 单笔下单最大数量
+retry_attempts: 8             # 允许的价格调整重试次数（最大买入/卖出尝试次数 = retry_attempts + 1）
+price_tolerance_step: 0.0075  # 每次重试的价格退让步长（0.75%）
+wait_seconds: 6.0             # 每次等待成交的时间 / 拆单间隔（秒）
+poll_interval_seconds: 1.0    # 轮询订单状态的间隔（秒）
+order_interval_seconds: 0.5   # 拆单之间的额外延时（秒），默认立即处理
+min_quote_amount: 1.0         # 单笔买单最少花费的美元金额，用于避免 <$1 的拆单

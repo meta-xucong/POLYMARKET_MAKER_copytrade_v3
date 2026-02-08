@@ -1,0 +1,36 @@
+{
+  "market_url": null,
+  "timezone": "America/New_York",
+  "deadline_override_ts": null,
+  "disable_deadline_checks": false,
+  "deadline_policy": {
+    "override_choice": null,
+    "disable_deadline": false,
+    "timezone": "America/New_York",
+    "default_deadline": {
+      "time": "12:59",
+      "timezone": "America/New_York"
+    }
+  },
+  "side": null,
+  "order_size": null,
+  "order_size_is_target": true,
+  "sell_mode": "aggressive",
+  "buy_price_threshold": null,
+  "drop_window_minutes": 60,
+  "drop_pct": 0.001,
+  "profit_pct": 0.005,
+  "enable_incremental_drop_pct": true,
+  "incremental_drop_pct_step": 0.0002,
+  "stagnation_window_minutes": 120,
+  "stagnation_pct": 0.002,
+  "no_event_exit_minutes": 10,
+  "signal_timeout_minutes": 30,
+  "max_buy_price": 0.98,
+  "sell_inactive_hours": 4,
+  "countdown": {
+    "minutes_before_end": 300,
+    "absolute_time": null,
+    "timezone": null
+  }
+}
