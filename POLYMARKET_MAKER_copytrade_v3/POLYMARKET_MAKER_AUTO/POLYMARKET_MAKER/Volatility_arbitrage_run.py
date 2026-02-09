@@ -3505,6 +3505,96 @@ def main(run_config: Optional[Dict[str, Any]] = None):
     def _exit_signal_active() -> bool:
         return bool(exit_signal_path and exit_signal_path.exists())
 
+    def _read_exit_signal_keep_sell() -> bool:
+        """读取退出信号文件中的 keep_sell 标志。"""
+        if not exit_signal_path or not exit_signal_path.exists():
+            return False
+        try:
+            with open(exit_signal_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return bool(data.get("keep_sell", False))
+        except Exception:
+            return False
+
+    def _graceful_exit_keep_sell(reason: str) -> None:
+        """
+        优雅退出：保留 SELL 挂单，只撤 BUY 挂单。
+        用于淘汰（eviction）或其他需要保留 SELL 的退出场景。
+        """
+        if stop_event.is_set():
+            return
+        print(f"[EXIT] 收到退出信号（保留SELL）: {reason}")
+
+        # 只撤 BUY 挂单
+        _cancel_open_buy_orders_before_exit("GRACEFUL_EXIT_KEEP_SELL")
+
+        # 收集当前 SELL 订单信息
+        orphan_order_id = None
+        orphan_sell_price = None
+        remaining_size = 0.0
+        try:
+            open_orders = _fetch_open_orders_norm(client)
+            for order in open_orders:
+                order_token = order.get("asset_id") or order.get("token_id") or ""
+                order_side = str(order.get("side") or "").upper()
+                if order_token == token_id and order_side == "SELL":
+                    orphan_order_id = order.get("id") or order.get("order_id")
+                    orphan_sell_price = float(order.get("price") or 0)
+                    remaining_size = float(order.get("original_size") or order.get("size") or 0)
+                    break
+        except Exception as exc:
+            print(f"[EXIT] 获取 SELL 订单信息失败: {exc}")
+
+        # 获取持仓和价格信息
+        snap = latest.get(token_id) or {}
+        status = strategy.status()
+        try:
+            strategy_position = float(status.get("position") or 0)
+        except (TypeError, ValueError):
+            strategy_position = 0.0
+        position_size = remaining_size or strategy_position
+
+        # 只有确实有持仓且有存活 SELL 订单时才标记 orphan_sell
+        has_real_position = position_size > 0.5  # 超过 dust 阈值
+        has_sell_order = orphan_order_id is not None
+
+        if has_real_position and has_sell_order:
+            _record_exit_token(token_id, "SELL_ABANDONED_KEEP_SELL", {
+                "has_position": True,
+                "position_size": position_size,
+                "entry_price": status.get("entry_price"),
+                "last_bid": float(snap.get("best_bid") or 0.0),
+                "last_ask": float(snap.get("best_ask") or 0.0),
+                "orphan_sell": True,
+                "orphan_sell_order_id": orphan_order_id,
+                "orphan_sell_price": orphan_sell_price,
+                "orphan_sell_remaining": remaining_size,
+                "orphan_created_at": time.time(),
+            })
+            print(
+                f"[EXIT] 已保留 SELL 挂单并记录孤儿状态: "
+                f"order_id={orphan_order_id} position={position_size:.4f}"
+            )
+        elif has_real_position:
+            # 有持仓但无存活 SELL 订单 → 普通退出记录（走回填）
+            _record_exit_token(token_id, "SELL_ABANDONED", {
+                "has_position": True,
+                "position_size": position_size,
+                "entry_price": status.get("entry_price"),
+                "last_bid": float(snap.get("best_bid") or 0.0),
+                "last_ask": float(snap.get("best_ask") or 0.0),
+            })
+            print(f"[EXIT] 无存活 SELL 订单，记录为普通退出: position={position_size:.4f}")
+        else:
+            # 无持仓 → 正常退出，不标记 orphan
+            _record_exit_token(token_id, "GRACEFUL_EXIT", {
+                "has_position": False,
+            })
+            print("[EXIT] 无持仓，正常退出")
+
+        strategy.stop(f"graceful exit keep sell: {reason}")
+        stop_event.set()
+
     def _force_exit(reason: str) -> None:
         """
         正在运行的进程收到 exit signal 时的清仓函数。
@@ -3953,6 +4043,7 @@ def main(run_config: Optional[Dict[str, Any]] = None):
                 stop_check=stop_event.is_set,
                 sell_mode=sell_mode,
                 inactive_timeout_sec=dynamic_sell_timeout_sec,
+                keep_sell_on_abandon=True,
                 progress_probe=_sell_progress_probe,
                 progress_probe_interval=60.0,
                 position_fetcher=_position_size_fetcher,
@@ -3967,31 +4058,45 @@ def main(run_config: Optional[Dict[str, Any]] = None):
         print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
         sell_status = str(sell_resp.get("status") or "").upper()
         if sell_status == "ABANDONED":
-            print(
-                "[RELEASE] 卖出挂单长期无动作，准备退出。"
-            )
-            # 防御性撤单：确保不残留卖单锁定仓位（maker_execution 层已尝试撤单，
-            # 此处作为第二道防线以防上层撤单失败或遗漏）
-            try:
-                canceled = _cancel_open_orders_for_token(client, token_id)
-                if canceled:
-                    print(f"[RELEASE] ABANDONED 退出前撤销 {canceled} 个残留挂单")
-            except Exception:
-                pass
-            # 获取当前持仓和价格信息用于回填
+            # 新逻辑：保留 SELL 挂单在市场，只撤 BUY 挂单
+            # maker_execution 层已通过 keep_sell_on_abandon=True 保留了 SELL 订单
+            orphan_order_id = sell_resp.get("orphan_sell_order_id")
+            orphan_sell_price = sell_resp.get("orphan_sell_price")
+            remaining_size = float(sell_resp.get("remaining") or eff_qty)
+
+            if orphan_order_id:
+                print(
+                    f"[RELEASE] 卖出挂单长期无动作，保留 SELL 挂单退出。"
+                    f" orphan_order_id={orphan_order_id}"
+                    f" price={orphan_sell_price} remaining={remaining_size:.4f}"
+                )
+            else:
+                print(
+                    "[RELEASE] 卖出挂单长期无动作（无存活 SELL 订单），准备退出。"
+                )
+
+            # 只撤 BUY 挂单，保留 SELL
+            _cancel_open_buy_orders_before_exit("SELL_ABANDONED_KEEP_SELL")
+
+            # 获取当前持仓和价格信息
             snap = latest.get(token_id) or {}
             status = strategy.status()
-            _cancel_open_buy_orders_before_exit("SELL_ABANDONED")
-            _record_exit_token(token_id, "SELL_ABANDONED", {
-                "has_position": True,  # 仍有持仓
-                "position_size": float(sell_resp.get("remaining") or eff_qty),
+            _record_exit_token(token_id, "SELL_ABANDONED_KEEP_SELL", {
+                "has_position": True,
+                "position_size": remaining_size,
                 "entry_price": status.get("entry_price"),
                 "last_bid": float(snap.get("best_bid") or 0.0),
                 "last_ask": float(snap.get("best_ask") or 0.0),
                 "sell_floor_price": floor_price,
                 "inactive_timeout_hours": dynamic_sell_timeout_sec / 3600.0,
+                # 孤儿 SELL 订单元数据（供调度器监控）
+                "orphan_sell": True,
+                "orphan_sell_order_id": orphan_order_id,
+                "orphan_sell_price": orphan_sell_price,
+                "orphan_sell_remaining": remaining_size,
+                "orphan_created_at": time.time(),
             })
-            strategy.stop("sell inactive release")
+            strategy.stop("sell inactive release (keep sell)")
             stop_event.set()
             return
         sell_filled = float(sell_resp.get("filled") or 0.0)
@@ -4202,7 +4307,10 @@ def main(run_config: Optional[Dict[str, Any]] = None):
                 if use_shared_ws:
                     _apply_shared_ws_snapshot()
                 if _exit_signal_active():
-                    _force_exit("sell signal file detected")
+                    if _read_exit_signal_keep_sell():
+                        _graceful_exit_keep_sell("exit signal with keep_sell=True")
+                    else:
+                        _force_exit("sell signal file detected")
                     break
                 if pending_buy is not None and now >= buy_cooldown_until:
                     if sell_only_event.is_set():

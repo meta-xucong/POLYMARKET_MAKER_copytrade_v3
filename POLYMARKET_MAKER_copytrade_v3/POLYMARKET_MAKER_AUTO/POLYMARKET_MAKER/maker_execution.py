@@ -1226,6 +1226,7 @@ def maker_sell_follow_ask_with_floor_wait(
     aggressive_step: float = 0.01,
     aggressive_timeout: float = 300.0,
     inactive_timeout_sec: float = 0.0,
+    keep_sell_on_abandon: bool = False,
     progress_probe: Optional[Callable[[], None]] = None,
     progress_probe_interval: float = 60.0,
     position_fetcher: Optional[Callable[[], Optional[float]]] = None,
@@ -1363,15 +1364,25 @@ def maker_sell_follow_ask_with_floor_wait(
 
         now = time.time()
         if inactive_timeout_sec and now - last_activity_ts >= inactive_timeout_sec:
-            # 撤销残留的 active sell order，避免锁定 token 仓位
-            if active_order:
-                try:
-                    _cancel_order(client, active_order)
-                    rec = records.get(active_order)
-                    if rec is not None:
-                        rec["status"] = "CANCELLED"
-                except Exception as cancel_exc:
-                    print(f"[MAKER][SELL] ABANDONED 撤单失败: {cancel_exc}")
+            if keep_sell_on_abandon and active_order:
+                # 保留 SELL 挂单在市场：不撤单，记录孤儿订单信息
+                rec = records.get(active_order)
+                print(
+                    f"[MAKER][SELL] ABANDONED (keep_sell=True) -> "
+                    f"保留 SELL 挂单 order_id={active_order} "
+                    f"price={active_price} "
+                    f"remaining={remaining:.4f}"
+                )
+            else:
+                # 撤销残留的 active sell order，避免锁定 token 仓位
+                if active_order:
+                    try:
+                        _cancel_order(client, active_order)
+                        rec = records.get(active_order)
+                        if rec is not None:
+                            rec["status"] = "CANCELLED"
+                    except Exception as cancel_exc:
+                        print(f"[MAKER][SELL] ABANDONED 撤单失败: {cancel_exc}")
             final_status = "ABANDONED"
             break
         if (
@@ -2025,10 +2036,15 @@ def maker_sell_follow_ask_with_floor_wait(
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None
     remaining = max(goal_size - filled_total, 0.0)
-    return {
+    result = {
         "status": final_status,
         "avg_price": avg_price,
         "filled": filled_total,
         "remaining": remaining,
         "orders": orders,
     }
+    # 当 keep_sell_on_abandon=True 且 ABANDONED 时，返回仍然存活的订单信息
+    if final_status == "ABANDONED" and keep_sell_on_abandon and active_order:
+        result["orphan_sell_order_id"] = active_order
+        result["orphan_sell_price"] = active_price
+    return result

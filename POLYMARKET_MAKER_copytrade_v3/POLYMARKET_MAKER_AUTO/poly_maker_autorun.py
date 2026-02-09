@@ -73,6 +73,12 @@ DEFAULT_GLOBAL_CONFIG = {
     "shared_ws_wait_pause_minutes": 1.0,
     "shared_ws_wait_escalation_window_sec": 240.0,
     "shared_ws_wait_escalation_min_failures": 2,
+    # 孤儿 SELL 监控与优先重入配置
+    "orphan_fill_monitor_interval_sec": 30.0,   # 孤儿 SELL 成交检测间隔
+    "orphan_sell_ttl_hours": 24.0,              # 孤儿 SELL 最大存活时间（超过后降级为普通回填）
+    "orphan_sell_guardian_interval_sec": 300.0,  # 孤儿守护检查间隔
+    "reenter_cooldown_sec": 600.0,              # 同 token 重入冷却（防抖动）
+    "eviction_min_advantage_score": 0.3,        # 抢占最小优势分（防抖动）
 }
 
 # Shared WS 等待防抖参数（写死，避免依赖外部 JSON）
@@ -453,6 +459,12 @@ class GlobalConfig:
     # Maker 子进程配置
     maker_poll_sec: float = 10.0  # 挂单轮询间隔（秒）
     maker_position_sync_interval: float = 60.0  # 仓位同步间隔（秒）
+    # 孤儿 SELL 监控与优先重入配置
+    orphan_fill_monitor_interval_sec: float = DEFAULT_GLOBAL_CONFIG["orphan_fill_monitor_interval_sec"]
+    orphan_sell_ttl_hours: float = DEFAULT_GLOBAL_CONFIG["orphan_sell_ttl_hours"]
+    orphan_sell_guardian_interval_sec: float = DEFAULT_GLOBAL_CONFIG["orphan_sell_guardian_interval_sec"]
+    reenter_cooldown_sec: float = DEFAULT_GLOBAL_CONFIG["reenter_cooldown_sec"]
+    eviction_min_advantage_score: float = DEFAULT_GLOBAL_CONFIG["eviction_min_advantage_score"]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GlobalConfig":
@@ -713,6 +725,18 @@ class AutoRunManager:
         # WS 健康分层清理状态
         self._ws_recent_recovery_ts: Dict[str, float] = {}
         self._ws_prev_stale_state: Dict[str, bool] = {}
+        # ===== 孤儿 SELL 监控与优先重入 =====
+        # 孤儿 SELL token 追踪: token_id -> {order_id, price, remaining, entry_price, created_at, ...}
+        self._orphan_sell_tokens: Dict[str, Dict[str, Any]] = {}
+        # 高优先级重入队列（SELL 成交后需要立即拉回的 token）
+        self.priority_reenter_topics: List[str] = []
+        # 填充监控定时器
+        self._next_orphan_fill_check: float = 0.0
+        self._next_orphan_guardian_check: float = 0.0
+        # 重入冷却：token_id -> 上次重入时间戳（防抖动）
+        self._reenter_cooldown_until: Dict[str, float] = {}
+        # 孤儿 SELL 状态持久化路径
+        self._orphan_sell_path = self.config.data_dir / "orphan_sell_tokens.json"
         # 日志清理相关（每天清理7天前的日志）
         self._next_log_cleanup: float = 0.0
         self._log_cleanup_interval_sec: float = 3600.0  # 每小时检查一次
@@ -733,6 +757,8 @@ class AutoRunManager:
                     self._process_commands()
                     self._poll_tasks()
                     self._schedule_pending_exit_cleanup()
+                    # 优先重入队列优先于普通 pending（SELL 成交后立即拉回）
+                    self._schedule_priority_reenter()
                     self._schedule_pending_topics()
                     self._purge_inactive_tasks()
                     if now >= self._next_topics_refresh:
@@ -740,6 +766,14 @@ class AutoRunManager:
                         # 清理 MARKET_CLOSED 的 token（从 copytrade 文件中移除）
                         self._cleanup_closed_market_tokens()
                         self._next_topics_refresh = now + self.config.copytrade_poll_sec
+                    # 孤儿 SELL 成交监控（检测不在子进程中的 token 卖出成交）
+                    if self._orphan_sell_tokens and now >= self._next_orphan_fill_check:
+                        self._monitor_orphan_fills()
+                        self._next_orphan_fill_check = now + self.config.orphan_fill_monitor_interval_sec
+                    # 孤儿 SELL 守护（TTL 过期、订单失效等兜底处理）
+                    if self._orphan_sell_tokens and now >= self._next_orphan_guardian_check:
+                        self._orphan_sell_guardian()
+                        self._next_orphan_guardian_check = now + self.config.orphan_sell_guardian_interval_sec
                     # Slot回填检查
                     if self.config.enable_slot_refill and now >= self._next_refill_check:
                         self._schedule_refill()
@@ -1466,8 +1500,13 @@ class AutoRunManager:
         task.heartbeat(f"process finished rc={rc}")
         self._update_log_excerpt(task)
 
+        # 检测孤儿 SELL 退出（SELL_ABANDONED_KEEP_SELL）：
+        # 子进程正常退出（rc=0）且退出记录含 orphan_sell=True → 注册孤儿 SELL 追踪
+        if rc == 0 and task.end_reason not in ("sell signal", "sell signal cleanup"):
+            self._try_register_orphan_from_exit_record(task.topic_id)
+
         # 如果是因 sell signal 退出（包括运行中收到信号和 exit-only cleanup），
-        # 仅在子进程退出码为 0 时标记“清仓完成”；
+        # 仅在子进程退出码为 0 时标记"清仓完成"；
         # 非 0 视作异常，自动补排一次 exit-only cleanup，避免漏清仓。
         if task.end_reason in ("sell signal", "sell signal cleanup"):
             if rc == 0:
@@ -1732,6 +1771,422 @@ class AutoRunManager:
                 continue
             self._start_exit_cleanup(token_id)
             exit_running += 1
+
+    # ===== 孤儿 SELL 监控与优先重入 =====
+
+    def _is_token_in_any_queue(self, token_id: str) -> bool:
+        """检查 token 是否已在任意活跃队列/容器中（防重复）。"""
+        if token_id in self.tasks and self.tasks[token_id].is_running():
+            return True
+        if token_id in self.pending_topics:
+            return True
+        if token_id in self.pending_exit_topics:
+            return True
+        if token_id in self.priority_reenter_topics:
+            return True
+        return False
+
+    def _register_orphan_sell(self, token_id: str, meta: Dict[str, Any]) -> None:
+        """
+        注册一个孤儿 SELL token（子进程退出但 SELL 挂单保留在市场）。
+        单一真相源入口：所有孤儿状态变更都经过此方法。
+        """
+        if self._is_token_in_any_queue(token_id):
+            print(
+                f"[ORPHAN] 跳过注册：token={token_id[:16]}... 已在活跃队列中"
+            )
+            return
+        self._orphan_sell_tokens[token_id] = {
+            "order_id": meta.get("orphan_sell_order_id"),
+            "price": meta.get("orphan_sell_price"),
+            "remaining": meta.get("orphan_sell_remaining") or meta.get("position_size"),
+            "entry_price": meta.get("entry_price"),
+            "sell_floor_price": meta.get("sell_floor_price"),
+            "position_size": meta.get("position_size"),
+            "created_at": meta.get("orphan_created_at") or time.time(),
+            "last_check_ts": time.time(),
+        }
+        self._persist_orphan_sell_tokens()
+        print(
+            f"[ORPHAN] 已注册孤儿 SELL: token={token_id[:16]}... "
+            f"order_id={meta.get('orphan_sell_order_id')} "
+            f"price={meta.get('orphan_sell_price')} "
+            f"remaining={meta.get('position_size')}"
+        )
+
+    def _unregister_orphan_sell(self, token_id: str, reason: str = "") -> None:
+        """移除孤儿 SELL 状态。"""
+        if token_id in self._orphan_sell_tokens:
+            self._orphan_sell_tokens.pop(token_id, None)
+            self._persist_orphan_sell_tokens()
+            print(f"[ORPHAN] 已移除孤儿 SELL: token={token_id[:16]}... reason={reason}")
+
+    def _try_register_orphan_from_exit_record(self, token_id: str) -> None:
+        """
+        从最新退出记录中检测是否为 SELL_ABANDONED_KEEP_SELL，
+        如果是则注册孤儿 SELL 追踪。
+        """
+        try:
+            exit_records = self._load_exit_tokens()
+            # 从后往前找该 token 的最新退出记录
+            for rec in reversed(exit_records):
+                if rec.get("token_id") != token_id:
+                    continue
+                if rec.get("exit_reason") != "SELL_ABANDONED_KEEP_SELL":
+                    break  # 最新记录不是 KEEP_SELL，跳过
+                exit_data = rec.get("exit_data") or {}
+                if exit_data.get("orphan_sell"):
+                    self._register_orphan_sell(token_id, exit_data)
+                break
+        except Exception as exc:
+            print(f"[ORPHAN][WARN] 检查退出记录失败: {exc}")
+
+    def _monitor_orphan_fills(self) -> None:
+        """
+        核心监控：检测孤儿 SELL token 的持仓变化。
+        如果持仓消失（SELL 成交），则触发高优先级重入。
+        如果持仓显著减少（部分成交），则降级为带持仓的回填。
+        安全策略：API 失败或地址不可用时，跳过本次检查，不做任何决策。
+        """
+        if not self._orphan_sell_tokens:
+            return
+
+        for token_id in list(self._orphan_sell_tokens.keys()):
+            # 跳过已在活跃队列中的 token（防重复拉起）
+            if self._is_token_in_any_queue(token_id):
+                self._unregister_orphan_sell(token_id, "already_in_queue")
+                continue
+
+            # 检查重入冷却
+            now = time.time()
+            cooldown_until = self._reenter_cooldown_until.get(token_id, 0.0)
+            if now < cooldown_until:
+                continue
+
+            # 通过 Data API 精确查询持仓大小（不使用 _has_account_position 的 dust 判断，
+            # 防止地址解析失败导致 has_position=False 的误判）
+            meta = self._orphan_sell_tokens[token_id]
+            try:
+                if not self._position_address:
+                    address, origin = _resolve_position_address_from_env()
+                    self._position_address = address
+                    self._position_address_origin = origin
+                if not self._position_address:
+                    # 无法获取地址 → 跳过本次检查，不做任何决策（安全默认）
+                    continue
+                pos_size, info = _fetch_position_size_from_data_api(
+                    self._position_address, token_id,
+                )
+                if info != "ok":
+                    # API 返回异常（网络错误、格式异常等）→ 跳过，不做决策
+                    continue
+            except Exception as exc:
+                print(f"[ORPHAN][WARN] 持仓检查失败 token={token_id[:16]}...: {exc}")
+                continue
+
+            actual_pos = float(pos_size or 0.0)
+            meta["last_check_ts"] = now
+            original_pos = float(meta.get("position_size") or meta.get("remaining") or 0.0)
+
+            if actual_pos <= POSITION_CLEANUP_DUST_THRESHOLD:
+                # 仓位完全清空（或仅剩尘埃量）→ SELL 完全成交 → 触发高优先级重入
+                print(
+                    f"\n[ORPHAN][FILL] 检测到孤儿 SELL 成交！"
+                    f" token={token_id[:16]}..."
+                    f" 原挂单价={meta.get('price')}"
+                    f" 剩余仓位={actual_pos:.4f}"
+                    f" → 触发高优先级重入"
+                )
+                self._unregister_orphan_sell(token_id, "sell_filled")
+                self._enqueue_priority_reenter(token_id, cause="orphan_sell_filled")
+            elif original_pos > 0 and actual_pos < original_pos * 0.5:
+                # 仓位大幅减少（>50% 已卖出）但仍有残留 → 部分成交
+                # 降级为带持仓的回填（新子进程会继续卖出剩余）
+                print(
+                    f"\n[ORPHAN][PARTIAL] 孤儿 SELL 部分成交"
+                    f" token={token_id[:16]}..."
+                    f" 原始={original_pos:.4f} 当前={actual_pos:.4f}"
+                    f" → 降级为带持仓回填"
+                )
+                self._unregister_orphan_sell(token_id, "partial_fill_refill")
+                self._write_exit_record_for_refill(
+                    token_id, "ORPHAN_PARTIAL_FILL", {
+                        "has_position": True,
+                        "position_size": actual_pos,
+                        "entry_price": meta.get("entry_price"),
+                    }
+                )
+
+    def _enqueue_priority_reenter(self, token_id: str, cause: str = "") -> None:
+        """
+        将 token 加入高优先级重入队列（去重 + 冷却检查）。
+        """
+        if not token_id:
+            return
+        # 去重：不与任何队列重复
+        if self._is_token_in_any_queue(token_id):
+            print(
+                f"[REENTER] 跳过重入入队：token={token_id[:16]}... 已在活跃队列中"
+            )
+            return
+        # 冷却检查
+        now = time.time()
+        cooldown_until = self._reenter_cooldown_until.get(token_id, 0.0)
+        if now < cooldown_until:
+            remaining = cooldown_until - now
+            print(
+                f"[REENTER] 跳过重入入队：token={token_id[:16]}... "
+                f"冷却中 (剩余 {remaining:.0f}s)"
+            )
+            return
+
+        if token_id not in self.priority_reenter_topics:
+            self.priority_reenter_topics.append(token_id)
+        # 设置冷却时间
+        self._reenter_cooldown_until[token_id] = now + self.config.reenter_cooldown_sec
+        print(
+            f"[REENTER] + 高优先级重入入队: token={token_id[:16]}... "
+            f"cause={cause}"
+        )
+
+    def _schedule_priority_reenter(self) -> None:
+        """
+        处理高优先级重入队列。
+        优先级高于 pending_topics，但低于 pending_exit_topics。
+        如果满载则尝试抢占。
+        """
+        if not self.priority_reenter_topics:
+            return
+
+        running = sum(1 for t in self.tasks.values() if t.is_running())
+        max_slots = max(1, int(self.config.max_concurrent_tasks))
+
+        while self.priority_reenter_topics:
+            token_id = self.priority_reenter_topics[0]  # peek
+
+            # 如果已在运行，直接移除
+            if token_id in self.tasks and self.tasks[token_id].is_running():
+                self.priority_reenter_topics.pop(0)
+                continue
+
+            if running < max_slots:
+                # 有空槽位：直接加入 pending_topics 的最前面
+                self.priority_reenter_topics.pop(0)
+                self._prepare_reenter_topic(token_id)
+                # 插入到 pending_topics 最前面（优先调度）
+                if token_id in self.pending_topics:
+                    self.pending_topics.remove(token_id)
+                self.pending_topics.insert(0, token_id)
+                self._pending_first_seen.setdefault(token_id, time.time())
+                print(
+                    f"[REENTER] 高优先级重入 → pending 队首: token={token_id[:16]}..."
+                )
+                break  # 让 _schedule_pending_topics 处理实际启动
+            else:
+                # 满载：尝试抢占
+                evicted = self._try_evict_for_priority(token_id)
+                if evicted:
+                    self.priority_reenter_topics.pop(0)
+                    self._prepare_reenter_topic(token_id)
+                    if token_id in self.pending_topics:
+                        self.pending_topics.remove(token_id)
+                    self.pending_topics.insert(0, token_id)
+                    self._pending_first_seen.setdefault(token_id, time.time())
+                    print(
+                        f"[REENTER] 满载抢占成功 → pending 队首: token={token_id[:16]}..."
+                    )
+                    break  # 等被淘汰的进程退出后自然空出槽位
+                else:
+                    # 无法抢占，保持在队列中等待
+                    print(
+                        f"[REENTER] 满载且无可淘汰候选，等待空槽: "
+                        f"token={token_id[:16]}... queue_size={len(self.priority_reenter_topics)}"
+                    )
+                    break
+
+    def _prepare_reenter_topic(self, token_id: str) -> None:
+        """
+        为高优先级重入 token 准备恢复配置。
+        SELL 已成交意味着仓位已清空，应该以全新买入开始。
+        """
+        # SELL 成交后仓位已清空 → 不设置 resume_state → 正常买入流程
+        if token_id not in self.topic_details:
+            self.topic_details[token_id] = {}
+        # 清除可能残留的 resume_state（仓位已清空）
+        self.topic_details[token_id].pop("resume_state", None)
+        self.topic_details[token_id].pop("refill_retry_count", None)
+        self.topic_details[token_id].pop("refill_exit_reason", None)
+        # 清除旧的交易周期状态
+        self._refill_retry_counts.pop(token_id, None)
+        self._refilled_tokens.discard(token_id)
+        self._completed_exit_cleanup_tokens.discard(token_id)
+        self._handled_sell_signals.discard(token_id)
+        self._exit_cleanup_retry_counts.pop(token_id, None)
+
+    def _try_evict_for_priority(self, priority_token_id: str) -> bool:
+        """
+        满载时尝试淘汰一个"距退出阈值最近 + 质量最低"的 running token，
+        释放槽位给高优先级重入 token。
+
+        Returns:
+            True 表示已向被淘汰 token 发出退出信号。
+        """
+        running_tasks = [
+            t for t in self.tasks.values()
+            if t.is_running()
+            and t.end_reason not in ("sell signal", "sell signal cleanup")  # 不淘汰清仓任务
+        ]
+        if not running_tasks:
+            return False
+
+        # 计算每个 running token 的淘汰分数（越高越该被淘汰）
+        scored: List[tuple] = []
+        now = time.time()
+        for task in running_tasks:
+            # 跳过刚启动不久的（至少运行 5 分钟才可淘汰）
+            runtime = now - task.start_time
+            if runtime < 300:
+                continue
+            # 主要依据运行时长来评分：运行时间越长，越接近自然退出阈值
+            # 分数 0~1 归一化：假设典型生命周期 3 小时
+            time_score = min(runtime / (3 * 3600), 1.0)
+            scored.append((time_score, task))
+
+        if not scored:
+            return False
+
+        # 选最高分（运行最久）
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, candidate = scored[0]
+
+        # 检查最小优势阈值（防抖动）
+        if best_score < self.config.eviction_min_advantage_score:
+            print(
+                f"[EVICT] 候选分数不足: score={best_score:.2f} "
+                f"< threshold={self.config.eviction_min_advantage_score}"
+            )
+            return False
+
+        # 对被淘汰 token 发送退出信号（普通退出，保留 SELL，非强平）
+        evict_token = candidate.topic_id
+        candidate.no_restart = True
+        candidate.end_reason = "evicted_for_priority"
+        candidate.heartbeat(f"evicted for priority reenter of {priority_token_id[:16]}")
+        self._issue_exit_signal(evict_token, keep_sell=True)
+        print(
+            f"[EVICT] 淘汰 token={evict_token[:16]}... "
+            f"(score={best_score:.2f}, runtime={now - candidate.start_time:.0f}s) "
+            f"→ 为 {priority_token_id[:16]}... 让出槽位"
+        )
+        return True
+
+    def _orphan_sell_guardian(self) -> None:
+        """
+        孤儿 SELL 守护任务：
+        1. TTL 过期 → 降级为普通回填
+        2. 检测订单是否仍然存活（如果可以的话）
+        """
+        if not self._orphan_sell_tokens:
+            return
+
+        now = time.time()
+        ttl_sec = self.config.orphan_sell_ttl_hours * 3600.0
+
+        for token_id in list(self._orphan_sell_tokens.keys()):
+            meta = self._orphan_sell_tokens[token_id]
+            created_at = meta.get("created_at", now)
+            age = now - created_at
+
+            if age >= ttl_sec:
+                # TTL 过期：移除孤儿状态，降级为普通回填
+                print(
+                    f"[ORPHAN][GUARDIAN] TTL 过期: token={token_id[:16]}... "
+                    f"age={age / 3600.0:.1f}h > ttl={self.config.orphan_sell_ttl_hours}h"
+                    f" → 降级为普通回填"
+                )
+                self._unregister_orphan_sell(token_id, "ttl_expired")
+                # 尝试加入普通回填：写一条退出记录让 refill 机制接管
+                _exit_data = {
+                    "has_position": True,
+                    "position_size": meta.get("position_size") or meta.get("remaining"),
+                    "entry_price": meta.get("entry_price"),
+                    "orphan_ttl_expired": True,
+                }
+                self._write_exit_record_for_refill(
+                    token_id, "ORPHAN_TTL_EXPIRED", _exit_data
+                )
+
+    def _write_exit_record_for_refill(
+        self, token_id: str, exit_reason: str, exit_data: Dict[str, Any]
+    ) -> None:
+        """从调度侧写入退出记录（供 refill 机制使用）。"""
+        record = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "exit_ts": time.time(),
+            "token_id": token_id,
+            "exit_reason": exit_reason,
+            "exit_data": exit_data,
+            "refillable": True,
+        }
+        try:
+            existing = []
+            if self._exit_tokens_path.exists():
+                try:
+                    with self._exit_tokens_path.open("r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                    if not isinstance(existing, list):
+                        existing = []
+                except (json.JSONDecodeError, OSError):
+                    existing = []
+            existing.append(record)
+            if len(existing) > 1000:
+                existing = existing[-1000:]
+            tmp_path = self._exit_tokens_path.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            tmp_path.replace(self._exit_tokens_path)
+        except Exception as exc:
+            print(f"[ORPHAN][WARN] 写入退出记录失败: {exc}")
+
+    def _persist_orphan_sell_tokens(self) -> None:
+        """持久化孤儿 SELL 状态到文件。"""
+        try:
+            tmp_path = self._orphan_sell_path.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._orphan_sell_tokens, f, ensure_ascii=False, indent=2)
+            tmp_path.replace(self._orphan_sell_path)
+        except Exception as exc:
+            print(f"[ORPHAN][WARN] 持久化孤儿状态失败: {exc}")
+
+    def _restore_orphan_sell_tokens(self) -> None:
+        """从文件恢复孤儿 SELL 状态（带队列重叠检查）。"""
+        if not self._orphan_sell_path.exists():
+            return
+        try:
+            with self._orphan_sell_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            # 过滤掉已在其他队列中的 token（防止重启后双状态）
+            filtered = {}
+            skipped = []
+            for token_id, meta in data.items():
+                if self._is_token_in_any_queue(token_id):
+                    skipped.append(token_id)
+                    continue
+                filtered[token_id] = meta
+            self._orphan_sell_tokens = filtered
+            if skipped:
+                preview = ", ".join(t[:8] + "..." for t in skipped[:5])
+                print(
+                    f"[ORPHAN] 恢复时跳过 {len(skipped)} 个已在队列中的 token: {preview}"
+                )
+            if filtered:
+                print(
+                    f"[ORPHAN] 已恢复 {len(filtered)} 个孤儿 SELL token"
+                )
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[ORPHAN][WARN] 恢复孤儿状态失败: {exc}")
 
     def _enqueue_pending_topic(self, topic_id: str) -> None:
         if not topic_id:
@@ -2224,16 +2679,29 @@ class AutoRunManager:
         print(f"[WARN] 未识别命令: {cmd}")
 
     def _print_status(self) -> None:
-        if not self.tasks:
-            print("[RUN] 当前无运行中的话题")
-            return
         running_tasks = self._ordered_running_tasks()
-        if not running_tasks:
+        if not running_tasks and not self._orphan_sell_tokens:
             print("[RUN] 当前无运行中的话题")
             return
 
         for idx, task in enumerate(running_tasks, 1):
             self._print_single_task(task, idx)
+
+        # 打印孤儿 SELL 状态
+        if self._orphan_sell_tokens:
+            now = time.time()
+            for token_id, meta in self._orphan_sell_tokens.items():
+                age_h = (now - meta.get("created_at", now)) / 3600.0
+                print(
+                    f"[ORPHAN] token={token_id[:16]}... "
+                    f"price={meta.get('price')} "
+                    f"remaining={meta.get('remaining')} "
+                    f"age={age_h:.1f}h"
+                )
+        # 打印高优先级重入队列
+        if self.priority_reenter_topics:
+            preview = ", ".join(t[:12] + "..." for t in self.priority_reenter_topics[:5])
+            print(f"[REENTER] 高优先级重入队列: {len(self.priority_reenter_topics)} 个 [{preview}]")
 
     def _print_single_task(self, task: TopicTask, index: Optional[int] = None) -> None:
         hb = task.last_heartbeat
@@ -2593,6 +3061,19 @@ class AutoRunManager:
                     skip_stats["permanent_block"] = skip_stats.get("permanent_block", 0) + 1
                 continue
 
+            # 孤儿 SELL token 不走普通回填（由 _monitor_orphan_fills 专门监控）
+            if token_id in self._orphan_sell_tokens:
+                skip_stats["orphan_sell_active"] = skip_stats.get("orphan_sell_active", 0) + 1
+                continue
+            # SELL_ABANDONED_KEEP_SELL 记录不走普通回填（由孤儿监控机制处理）
+            if exit_reason == "SELL_ABANDONED_KEEP_SELL":
+                skip_stats["keep_sell_active"] = skip_stats.get("keep_sell_active", 0) + 1
+                continue
+            # 在高优先级重入队列中的不重复回填
+            if token_id in self.priority_reenter_topics:
+                skip_stats["priority_reenter"] = skip_stats.get("priority_reenter", 0) + 1
+                continue
+
             # 检查是否已在运行或pending
             if token_id in self.tasks and self.tasks[token_id].is_running():
                 skip_stats["already_running"] = skip_stats.get("already_running", 0) + 1
@@ -2836,11 +3317,14 @@ class AutoRunManager:
         safe_id = _safe_topic_filename(token_id)
         return self.config.data_dir / f"exit_signal_{safe_id}.json"
 
-    def _issue_exit_signal(self, token_id: str) -> None:
+    def _issue_exit_signal(
+        self, token_id: str, *, keep_sell: bool = False
+    ) -> None:
         path = self._exit_signal_path(token_id)
         payload = {
             "token_id": token_id,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "keep_sell": keep_sell,
         }
         _dump_json_file(path, payload)
 
@@ -2927,6 +3411,19 @@ class AutoRunManager:
                     "[COPYTRADE] SELL 信号触发持仓清仓: "
                     f"token_id={token_id}"
                 )
+            # 如果 token 在孤儿 SELL 追踪中，强制移除（清仓信号最高优先级）
+            if token_id in self._orphan_sell_tokens:
+                print(
+                    f"[COPYTRADE] 清仓信号命中孤儿 SELL token: {token_id[:16]}... "
+                    f"→ 移除孤儿追踪，走强平路径"
+                )
+                self._unregister_orphan_sell(token_id, "sell_signal_override")
+            # 如果在高优先级重入队列中，移除
+            if token_id in self.priority_reenter_topics:
+                try:
+                    self.priority_reenter_topics.remove(token_id)
+                except ValueError:
+                    pass
             if token_id in self.pending_topics:
                 self._remove_pending_topic(token_id)
             if task and task.is_running():
@@ -3154,6 +3651,20 @@ class AutoRunManager:
             if str(token_id).strip()
         }
 
+        # 恢复高优先级重入队列
+        priority_reenter = payload.get("priority_reenter_topics") or []
+        for token_id in priority_reenter:
+            token_id = str(token_id)
+            if token_id not in self.priority_reenter_topics:
+                self.priority_reenter_topics.append(token_id)
+        if self.priority_reenter_topics:
+            print(
+                f"[RESTORE] 已恢复 {len(self.priority_reenter_topics)} 个高优先级重入 token"
+            )
+
+        # 恢复孤儿 SELL 状态（从独立文件）
+        self._restore_orphan_sell_tokens()
+
     def _dump_runtime_status(self) -> None:
         payload = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -3161,10 +3672,20 @@ class AutoRunManager:
             "handled_topics": sorted(self.handled_topics),
             "pending_topics": list(self.pending_topics),
             "pending_exit_topics": list(self.pending_exit_topics),
+            "priority_reenter_topics": list(self.priority_reenter_topics),
             "handled_sell_signals": sorted(self._handled_sell_signals),
             "completed_exit_cleanup_tokens": sorted(
                 self._completed_exit_cleanup_tokens
             ),
+            "orphan_sell_tokens": {
+                k: {
+                    "order_id": v.get("order_id"),
+                    "price": v.get("price"),
+                    "remaining": v.get("remaining"),
+                    "created_at": v.get("created_at"),
+                }
+                for k, v in self._orphan_sell_tokens.items()
+            },
             "tasks": {},
         }
         for topic_id, task in self.tasks.items():
@@ -3177,7 +3698,16 @@ class AutoRunManager:
                 "config_path": str(task.config_path) if task.config_path else None,
             }
         _dump_json_file(self.status_path, payload)
-        print(f"[STATE] 已写入运行状态到 {self.status_path}")
+        # 打印孤儿 SELL 状态摘要
+        if self._orphan_sell_tokens:
+            orphan_summary = ", ".join(
+                f"{k[:8]}..." for k in self._orphan_sell_tokens
+            )
+            print(
+                f"[STATE] 已写入运行状态 | 孤儿 SELL: {len(self._orphan_sell_tokens)} 个 [{orphan_summary}]"
+            )
+        else:
+            print(f"[STATE] 已写入运行状态到 {self.status_path}")
 
     # ========== 入口方法 ==========
     def command_loop(self) -> None:
