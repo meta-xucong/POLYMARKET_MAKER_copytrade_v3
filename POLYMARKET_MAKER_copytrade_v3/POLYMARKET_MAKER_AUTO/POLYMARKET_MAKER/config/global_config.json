@@ -1,0 +1,18 @@
+{
+  "scheduler": {
+    "max_concurrent_tasks": 10,
+    "command_poll_seconds": 30.0,
+    "copytrade_poll_seconds": 60.0,
+    "enable_slot_refill": true,
+    "refill_cooldown_minutes": 30,
+    "max_refill_retries": 3,
+    "refill_check_interval_sec": 60.0
+  },
+  "maker": {
+    "poll_sec": 10.0,
+    "position_sync_interval": 60.0
+  },
+  "debug": {
+    "ws_debug_raw": false
+  }
+}
